@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Brainlox Chatbot</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e3c72, #2a5298);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            color: #fff;
+        }
+        .chat-container {
+            background: #fff;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            width: 100%;
+            max-width: 600px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .chat-header {
+            background: #2a5298;
+            padding: 15px;
+            text-align: center;
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #fff;
+            border-bottom: 2px solid #1e3c72;
+        }
+        .chat-box {
+            flex: 1;
+            padding: 20px;
+            height: 400px;
+            overflow-y: auto;
+            background: #f9f9f9;
+            color: #333;
+        }
+        .message {
+            margin: 10px 0;
+            padding: 12px 18px;
+            border-radius: 20px;
+            max-width: 75%;
+            word-wrap: break-word;
+            animation: slideIn 0.3s ease;
+        }
+        .user-message {
+            background: #2a5298;
+            color: #fff;
+            align-self: flex-end;
+            margin-left: auto;
+        }
+        .bot-message {
+            background: #e0e0e0;
+            color: #333;
+            align-self: flex-start;
+        }
+        .typing {
+            font-style: italic;
+            color: #888;
+            align-self: flex-start;
+        }
+        .input-area {
+            display: flex;
+            padding: 15px;
+            background: #fff;
+            border-top: 1px solid #ddd;
+        }
+        #input {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #2a5298;
+            border-radius: 25px;
+            outline: none;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+        #input:focus {
+            border-color: #1e3c72;
+        }
+        button {
+            background: #2a5298;
+            color: #fff;
+            border: none;
+            padding: 10px 20px;
+            margin-left: 10px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1em;
+            transition: background 0.3s;
+        }
+        button:hover {
+            background: #1e3c72;
+        }
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+       ::-webkit-scrollbar {
+            width: 8px;
+        }
+       ::-webkit-scrollbar-thumb {
+            background: #2a5298;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">Brainlox Chatbot</div>
+        <div class="chat-box" id="chatbox"></div>
+        <div class="input-area">
+            <input type="text" id="input" placeholder="Ask me anything...">
+            <button onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+
+    <script>
+        const chatbox = document.getElementById('chatbox');
+        const input = document.getElementById('input');
+
+        function addMessage(text, isUser = false) {
+            const msg = document.createElement('div');
+            msg.className = `message ${isUser ? 'user-message' : 'bot-message'}`;
+            msg.textContent = text;
+            chatbox.appendChild(msg);
+            chatbox.scrollTop = chatbox.scrollHeight;
+        }
+
+        function showTyping() {
+            const typing = document.createElement('div');
+            typing.className = 'message typing';
+            typing.textContent = 'Typing...';
+            typing.id = 'typing-indicator';
+            chatbox.appendChild(typing);
+            chatbox.scrollTop = chatbox.scrollHeight;
+            return typing;
+        }
+
+        function removeTyping() {
+            const typing = document.getElementById('typing-indicator');
+            if (typing) typing.remove();
+        }
+
+        async function sendMessage() {
+            const query = input.value.trim();
+            if (!query) return;
+            addMessage(query, true);
+            input.value = '';
+
+            const typingIndicator = showTyping();
+
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query })
+                });
+                removeTyping();
+                const data = await response.json();
+                if (data.error) {
+                    addMessage(`Error: ${data.error}`);
+                } else {
+                    addMessage(data.response);
+                }
+            } catch (error) {
+                removeTyping();
+                addMessage('Oops! Something went wrong.');
+            }
+        }
+
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        // Welcome message
+        addMessage("Hey there! Ask me about Brainlox technical courses!");
+    </script>
+</body>
+</html>

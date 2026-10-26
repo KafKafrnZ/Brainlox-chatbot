@@ -166,9 +166,10 @@
                 removeTyping();
                 const data = await response.json();
                 if (data.error) {
-                    addMessage(`Error: ${data.error}`);
+                    addMessage('Error: ' + data.error);
                 } else {
-                    addMessage(data.response);
+                    var note = data.mode === 'retrieve' ? '\n\nMatching excerpt. Add GROQ_API_KEY or HF_API_TOKEN for a model answer.' : '';
+                    addMessage((data.response || '') + note);
                 }
             } catch (error) {
                 removeTyping();

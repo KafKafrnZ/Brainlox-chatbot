@@ -1,162 +1,206 @@
+"""Answer questions about Brainlox technical courses.
+
+The course-category page is split into chunks and ranked by word overlap.
+A model is called only when GROQ_API_KEY or HF_API_TOKEN is set. With no key,
+the reply is the best matching excerpt.
+"""
+
+from __future__ import annotations
+
+import json
 import os
-import logging
-from functools import lru_cache
-from typing import List
-from dotenv import load_dotenv
-from flask import Flask, request, send_from_directory
-from flask_restful import Resource, Api
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-from langchain_community.document_loaders import WebBaseLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEndpoint
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-from langchain.chains import RetrievalQA
-from langchain.memory import ConversationBufferMemory
+import re
+import time
+import urllib.request
+from html.parser import HTMLParser
 
-# Load environment variables from .env
-load_dotenv()
-
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Set USER_AGENT explicitly
-os.environ["USER_AGENT"] = "Brainlox-Chatbot/1.0"
-
-# Flask app setup
-app = Flask(__name__)
-api = Api(app)
-
-# Rate limiting
-limiter = Limiter(
-    get_remote_address,
-    app=app,
-    default_limits=["200 per day", "50 per hour"],
-    storage_uri="memory://"  # Change to "redis://localhost:6379" for production
-)
-
-# Configuration using environment variable for HF token
-CONFIG = {
-    "WEB_URLS": ["https://brainlox.com/courses/category/technical"],
-    "HF_API_TOKEN": os.getenv("HF_API_TOKEN"),  # Fetch from .env
-    "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
-    "LLM_MODEL": "HuggingFaceH4/zephyr-7b-beta",
-    "CHUNK_SIZE": 1000,
-    "CHUNK_OVERLAP": 200,
-    "DB_DIR": "./chroma_db",
-    "MAX_QUERY_LENGTH": 500,
-}
-
-def load_web_data(urls: List[str] = CONFIG["WEB_URLS"]) -> List:
-    try:
-        loader = WebBaseLoader(urls)
-        documents = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CONFIG["CHUNK_SIZE"],
-            chunk_overlap=CONFIG["CHUNK_OVERLAP"]
-        )
-        docs = text_splitter.split_documents(documents)
-        logger.info(f"Loaded and split {len(docs)} documents from {urls}")
-        return docs
-    except Exception as e:
-        logger.error(f"Failed to load web data: {e}")
-        return []
-
-def create_vector_store(docs: List) -> Chroma:
-    embeddings = HuggingFaceEmbeddings(model_name=CONFIG["EMBEDDING_MODEL"])
-    if os.path.exists(CONFIG["DB_DIR"]):
-        logger.info("Loading existing vector store")
-        return Chroma(persist_directory=CONFIG["DB_DIR"], embedding_function=embeddings)
-    logger.info("Creating new vector store")
-    vector_store = Chroma.from_documents(docs, embeddings, persist_directory=CONFIG["DB_DIR"])
-    return vector_store
-
-def initialize_chatbot():
-    # Check if token is loaded
-    if not CONFIG["HF_API_TOKEN"]:
-        raise ValueError("HF_API_TOKEN not found in .env file")
-    
-    os.environ["HUGGINGFACEHUB_API_TOKEN"] = CONFIG["HF_API_TOKEN"]
-    
-    docs = load_web_data()
-    if not docs:
-        raise RuntimeError("No documents loaded, cannot initialize chatbot")
-    
-    vector_store = create_vector_store(docs)
-    
-    llm = HuggingFaceEndpoint(
-        repo_id=CONFIG["LLM_MODEL"],
-        huggingfacehub_api_token=CONFIG["HF_API_TOKEN"],
-        temperature=0.7,
-        max_length=500
-    )
-    
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        output_key="result",
-        return_messages=True
-    )
-    
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=vector_store.as_retriever(),
-        memory=memory,
-        return_source_documents=True
-    )
-    return qa_chain
-
-# Initialize chatbot globally at startup
 try:
-    QA_CHAIN = initialize_chatbot()
-    logger.info("Chatbot initialized successfully")
-except Exception as e:
-    logger.critical(f"Failed to initialize chatbot at startup: {e}")
-    raise
+    from dotenv import load_dotenv
 
-@lru_cache(maxsize=100)
-def cached_query(query: str) -> dict:
-    return QA_CHAIN.invoke({"query": query})
+    load_dotenv()
+except ImportError:
+    pass
 
-# Flask Routes
-@app.route('/')
-def home():
-    return "Welcome to Brainlox Chatbot API. Visit /ui to chat."
+PAGE = "https://brainlox.com/courses/category/technical"
+MAX_QUERY = 500
+_WORD = re.compile(r"[a-z0-9]+")
 
-@app.route('/ui', methods=['GET'])
-def ui():
-    # Serve chat.html from the same directory as chatbot.py
-    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'chat.html')
+_chunks: list[dict] | None = None
+_hits: dict[str, list[float]] = {}
 
-# Chatbot API endpoint
-class ChatbotAPI(Resource):
-    @limiter.limit("5 per minute")
-    def post(self):
-        data = request.get_json()
-        query = data.get("query", "").strip()
-        if not query or len(query) > CONFIG["MAX_QUERY_LENGTH"]:
-            logger.warning(f"Invalid query received: {query}")
-            return {"error": "Invalid or too long query"}, 400
-        
+
+class _Text(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._skip = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "noscript"}:
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style", "noscript"} and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        text = " ".join(data.split())
+        if text:
+            self.parts.append(text)
+
+
+def page_text(html: str) -> str:
+    parser = _Text()
+    parser.feed(html)
+    return "\n".join(parser.parts)
+
+
+def chunk_text(text: str, source: str) -> list[dict]:
+    words = text.split()
+    chunks = []
+    size, step = 120, 90
+    for i in range(0, max(len(words), 1), step):
+        piece = " ".join(words[i : i + size]).strip()
+        if len(piece) > 40:
+            chunks.append({"text": piece, "source": source})
+        if i + size >= len(words):
+            break
+    return chunks
+
+
+def tokens(text: str) -> set[str]:
+    return {word for word in _WORD.findall(text.lower()) if len(word) > 2}
+
+
+def rank(query: str, chunks: list[dict]) -> list[dict]:
+    wanted = tokens(query)
+    scored = [(len(wanted & tokens(chunk["text"])), chunk) for chunk in chunks]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [chunk for score, chunk in scored if score][:3]
+
+
+def load_chunks() -> list[dict]:
+    import requests
+
+    response = requests.get(
+        PAGE, timeout=20, headers={"User-Agent": "Brainlox-Chatbot/1.0"}
+    )
+    response.raise_for_status()
+    return chunk_text(page_text(response.text), PAGE)
+
+
+def _post(url: str, payload: dict, headers: dict) -> dict | list | None:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", **headers},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def model_answer(query: str, excerpts: list[dict]) -> str | None:
+    context = "\n\n".join(item["text"] for item in excerpts)
+    prompt = (
+        "Answer using only the excerpts. If they do not contain the answer, say so.\n\n"
+        f"Excerpts:\n{context}\n\nQuestion: {query}"
+    )
+    groq = os.getenv("GROQ_API_KEY")
+    if groq:
+        data = _post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            {
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+            },
+            {"Authorization": f"Bearer {groq}"},
+        )
         try:
-            logger.info(f"Processing query: {query}")
-            result = cached_query(query)
-            return {
-                "response": result["result"],
-                "sources": [doc.page_content[:200] for doc in result["source_documents"]]
-            }, 200
-        except Exception as e:
-            logger.error(f"Error processing query: {e}")
-            return {"error": "Internal server error"}, 500
+            return data["choices"][0]["message"]["content"].strip()
+        except (TypeError, KeyError, IndexError):
+            return None
+    token = os.getenv("HF_API_TOKEN")
+    if token:
+        data = _post(
+            "https://api-inference.huggingface.co/models/HuggingFaceH4/zephyr-7b-beta",
+            {"inputs": prompt, "parameters": {"max_new_tokens": 300, "temperature": 0.2}},
+            {"Authorization": f"Bearer {token}"},
+        )
+        if isinstance(data, list) and data and "generated_text" in data[0]:
+            return data[0]["generated_text"].split(prompt)[-1].strip() or None
+    return None
 
-# Register API resource
-api.add_resource(ChatbotAPI, '/chat')
+
+def reply(query: str, chunks: list[dict]) -> dict:
+    hits = rank(query, chunks)
+    if not hits:
+        return {
+            "response": "Nothing on the technical-courses page matches that.",
+            "sources": [],
+            "mode": "retrieve",
+        }
+    text = model_answer(query, hits)
+    return {
+        "response": text or hits[0]["text"],
+        "sources": [hit["source"] for hit in hits],
+        "mode": "model" if text else "retrieve",
+    }
+
+
+def _limited(ip: str) -> bool:
+    now = time.time()
+    recent = [stamp for stamp in _hits.get(ip, []) if now - stamp < 60]
+    if len(recent) >= 5:
+        _hits[ip] = recent
+        return True
+    recent.append(now)
+    _hits[ip] = recent
+    return False
+
+
+def chunks() -> list[dict]:
+    global _chunks
+    if _chunks is None:
+        _chunks = load_chunks()
+    return _chunks
+
+
+def create_app():
+    from flask import Flask, request, send_from_directory
+
+    app = Flask(__name__)
+
+    @app.route("/")
+    def home():
+        return "Brainlox course Q&A. Open /ui to chat."
+
+    @app.route("/ui")
+    def ui():
+        here = os.path.dirname(os.path.abspath(__file__))
+        return send_from_directory(here, "chat.html")
+
+    @app.post("/chat")
+    def chat():
+        if _limited(request.remote_addr or "local"):
+            return {"error": "Too many questions. Wait a minute."}, 429
+        data = request.get_json(silent=True) or {}
+        query = str(data.get("query", "")).strip()
+        if not query or len(query) > MAX_QUERY:
+            return {"error": "Ask a shorter question."}, 400
+        try:
+            return reply(query, chunks())
+        except Exception:
+            return {"error": "The courses page could not be read."}, 502
+
+    return app
+
 
 if __name__ == "__main__":
-    try:
-        logger.info("Starting Flask application")
-        app.run(debug=False, host='0.0.0.0', port=5000)
-    except Exception as e:
-        logger.critical(f"Application failed to start: {e}")
+    create_app().run(host="127.0.0.1", port=5000, debug=False)
